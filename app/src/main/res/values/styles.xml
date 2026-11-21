@@ -1,0 +1,12 @@
+<resources>
+    <style name="PageleafTheme" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">#315747</item>
+        <item name="android:windowBackground">#FCFBF7</item>
+        <item name="android:statusBarColor">#FCFBF7</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:navigationBarColor">#FCFBF7</item>
+        <item name="android:windowLightNavigationBar">true</item>
+        <item name="android:windowActionModeOverlay">true</item>
+    </style>
+</resources>
