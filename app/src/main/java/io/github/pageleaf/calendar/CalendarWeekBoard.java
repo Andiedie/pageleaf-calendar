@@ -4,6 +4,7 @@ import android.graphics.Canvas;
 import android.graphics.Paint;
 import android.graphics.Typeface;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.View;
 import android.widget.FrameLayout;
 import android.widget.HorizontalScrollView;
@@ -33,6 +34,7 @@ final class CalendarWeekBoard {
     private final Grid nowLine;
     private final FrameLayout ribbons;
     private boolean restored;
+    private boolean positioningHours, touchingHours;
 
     CalendarWeekBoard(CalendarScreen ui) {
         this.ui = ui;
@@ -73,7 +75,18 @@ final class CalendarWeekBoard {
         dates.addView(ribbonScroll, lp(daysWidth, ribbonHeight));
         ribbons.setMinimumHeight(ribbonContent);
         ribbonScroll.addView(ribbons, new FrameLayout.LayoutParams(daysWidth, ribbonContent));
-        hours = new ScrollView(ui.activity);
+        hours = new ScrollView(ui.activity) {
+            @Override public boolean dispatchTouchEvent(MotionEvent event) {
+                int action = event.getActionMasked();
+                if (action == MotionEvent.ACTION_DOWN) touchingHours = true;
+                boolean handled = super.dispatchTouchEvent(event);
+                if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) touchingHours = false;
+                return handled;
+            }
+        };
+        hours.setOnScrollChangeListener((v, x, y, oldX, oldY) -> {
+            if (restored && !positioningHours && !hours.isInLayout() && y != oldY) ui.followWeekTime = false;
+        });
         hours.setVerticalScrollBarEnabled(true);
         view.addView(hours, growY());
         LinearLayout table = ui.row();
@@ -100,7 +113,8 @@ final class CalendarWeekBoard {
             if (restored || hours.getHeight() == 0) return;
             restored = true;
             double hour = Double.isNaN(ui.topHour) ? defaultHour() : ui.topHour;
-            hours.scrollTo(0, (int) Math.round(hour * hourHeight));
+            positionHours((int) Math.round(hour * hourHeight));
+            followNowIfNeeded();
             double left = Double.isNaN(ui.leftDay) ? Math.max(0, ui.focus.getDayOfWeek().getValue() - 2) : ui.leftDay;
             bodyX.scrollTo((int) Math.round(left * daysWidth / 7.0), 0);
         });
@@ -145,12 +159,28 @@ final class CalendarWeekBoard {
         if (daysWidth > bodyX.getWidth()) ui.leftDay = bodyX.getScrollX() * 7.0 / daysWidth;
     }
 
-    void scrollToNow() {
-        hours.smoothScrollTo(0, (int) Math.round(defaultHour() * hourHeight));
-        if (dayIndex >= 0 && dayIndex < 7) bodyX.smoothScrollTo(Math.max(0, edge(dayIndex) - bodyX.getWidth() / 3), 0);
+
+    void updateNow() {
+        nowLine.invalidate();
+        followNowIfNeeded();
     }
 
-    void updateNow() { nowLine.invalidate(); }
+    private void followNowIfNeeded() {
+        if (!restored || !ui.followWeekTime || touchingHours || dayIndex < 0 || dayIndex >= 7) return;
+        int height = hours.getHeight();
+        int marker = y(ui.now.getHour() * 60 + ui.now.getMinute());
+        int offset = marker - hours.getScrollY();
+        if (offset < ui.u(ui.choice(13, 9)) || offset >= height * .8f) {
+            positionHours(marker - Math.round(height * .45f));
+        }
+    }
+
+    private void positionHours(int y) {
+        // Restores and clock-driven movement must not be mistaken for manual browsing.
+        positioningHours = true;
+        try { hours.scrollTo(0, y); }
+        finally { positioningHours = false; }
+    }
 
     private View dateLabel(int index) {
         LocalDate date = monday.plusDays(index);

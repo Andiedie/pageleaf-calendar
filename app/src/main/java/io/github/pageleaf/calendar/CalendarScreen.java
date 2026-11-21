@@ -57,6 +57,7 @@ public final class CalendarScreen extends CalendarUi {
     private boolean started;
     private final Runnable rebuild = this::render;
     private CalendarWeekBoard board;
+    boolean followWeekTime = true;
     double topHour = Double.NaN, leftDay = Double.NaN;
     int agendaY;
     private ScrollView agendaScroll;
@@ -98,12 +99,23 @@ public final class CalendarScreen extends CalendarUi {
     }
 
     public void tick() {
+        tick(ZonedDateTime.now(ZoneId.systemDefault()));
+    }
+
+    void tick(ZonedDateTime time) {
         LocalDate previousDay = now.toLocalDate();
         ZoneId previousZone = zone;
-        zone = ZoneId.systemDefault();
-        now = ZonedDateTime.now(zone);
+        now = time;
+        zone = time.getZone();
         if (!previousDay.equals(now.toLocalDate()) || !previousZone.equals(zone)) {
-            if (followToday) focus = now.toLocalDate();
+            if (followToday) {
+                focus = now.toLocalDate();
+                if (mode == Mode.WEEK && followWeekTime) {
+                    // Start the new day at its time and column, including on a narrow screen.
+                    board = null;
+                    topHour = leftDay = Double.NaN;
+                }
+            }
             requestRange();
         } else if (mode == Mode.DAY) {
             scheduleRender();
@@ -168,6 +180,7 @@ public final class CalendarScreen extends CalendarUi {
         if (mode != nextMode) preferences.edit().putString("mode", nextMode.name()).apply();
         mode = nextMode;
         if (different) {
+            followWeekTime = true;
             board = null;
             agendaScroll = null;
             agendaY = 0;
@@ -283,7 +296,13 @@ public final class CalendarScreen extends CalendarUi {
         nav.addView(button("‹", 29, MUTED, false, "上一" + modeLabel(mode), () -> move(-1)), growX());
         nav.addView(button("今天", choice(19, 16), INK, false, "今天", () -> {
             select(mode, LocalDate.now(zone));
-            if (board != null) board.scrollToNow();
+            if (mode == Mode.WEEK) {
+                // Discard the old scroller as it may still be flinging from a swipe.
+                board = null;
+                topHour = leftDay = Double.NaN;
+                followWeekTime = true;
+                scheduleRender();
+            }
         }), lp(u(choice(53, 50)), MATCH));
         nav.addView(button("›", 29, MUTED, false, "下一" + modeLabel(mode), () -> move(1)), growX());
         controls.addView(space(), lp(u(choice(24, 10)), 1));
@@ -514,6 +533,7 @@ public final class CalendarScreen extends CalendarUi {
             b.putString("mode", mode.name());
             b.putLong("focus", focus.toEpochDay());
             b.putBoolean("follow", followToday);
+            b.putBoolean("followWeekTime", followWeekTime);
             b.putDouble("hour", topHour);
             b.putDouble("dayOffset", leftDay);
             b.putInt("agenda", agendaY);
@@ -526,11 +546,17 @@ public final class CalendarScreen extends CalendarUi {
             super.onRestoreInstanceState(b.getParcelable("view"));
             mode = readMode(b.getString("mode"));
             followToday = b.getBoolean("follow");
-            focus = followToday ? now.toLocalDate() : LocalDate.ofEpochDay(b.getLong("focus"));
+            followWeekTime = b.getBoolean("followWeekTime", true);
+            LocalDate savedFocus = LocalDate.ofEpochDay(b.getLong("focus"));
+            focus = followToday ? now.toLocalDate() : savedFocus;
             board = null;
             agendaScroll = null;
-            topHour = b.getDouble("hour", Double.NaN);
-            leftDay = b.getDouble("dayOffset", Double.NaN);
+            if (mode == Mode.WEEK && followToday && followWeekTime && !savedFocus.equals(focus)) {
+                topHour = leftDay = Double.NaN;
+            } else {
+                topHour = b.getDouble("hour", Double.NaN);
+                leftDay = b.getDouble("dayOffset", Double.NaN);
+            }
             agendaY = b.getInt("agenda");
             reopenDrawer = b.getBoolean("drawer");
             requestRange();
