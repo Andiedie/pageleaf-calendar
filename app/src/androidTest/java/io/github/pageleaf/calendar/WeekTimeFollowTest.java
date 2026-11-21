@@ -133,7 +133,7 @@ public class WeekTimeFollowTest extends ActivityInstrumentationTestCase2<MainAct
             assertFalse(screen.followWeekTime);
             screen.tick(time(today, 21));
             assertEquals(manual, view.getScrollY());
-            screen.setData(Collections.emptyList(), Collections.emptyList(), "", false);
+            screen.setData(Collections.emptyList(), Collections.emptyList(), "", false, 0);
         });
         getInstrumentation().waitForIdleSync();
         runTestOnUiThread(() -> {

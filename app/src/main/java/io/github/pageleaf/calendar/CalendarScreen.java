@@ -27,6 +27,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.NavigableMap;
+import java.util.TreeMap;
 
 import static io.github.pageleaf.calendar.CalendarGeometry.Mode;
 
@@ -40,6 +42,7 @@ public final class CalendarScreen extends CalendarUi {
 
     static final String[] WEEKDAYS = {"一", "二", "三", "四", "五", "六", "日"};
     static final DateTimeFormatter CLOCK = DateTimeFormatter.ofPattern("HH:mm", Locale.ROOT);
+    private static final DateTimeFormatter DATE_CLOCK = DateTimeFormatter.ofPattern("MM-dd HH:mm", Locale.ROOT);
     final Actions actions;
     final ScreenRoot root;
     final SharedPreferences preferences;
@@ -53,7 +56,9 @@ public final class CalendarScreen extends CalendarUi {
     private final Map<String, Data.Source> byId = new HashMap<>();
     final Map<LocalDate, List<Data.Entry>> byDate = new HashMap<>();
     boolean connected;
-    String status = "";
+    private String notice = "";
+    private long lastSync;
+    private TextView footerStatus;
     private boolean started;
     private final Runnable rebuild = this::render;
     private CalendarWeekBoard board;
@@ -61,6 +66,11 @@ public final class CalendarScreen extends CalendarUi {
     double topHour = Double.NaN, leftDay = Double.NaN;
     int agendaY;
     private ScrollView agendaScroll;
+    private LinearLayout dayCard, daySummary;
+    private TextView dayClock, monthTodayBadge;
+    private long nextSummaryChange;
+    private final Map<LocalDate, Runnable> monthHighlights = new HashMap<>();
+    private final NavigableMap<Long, List<Runnable>> eventEnds = new TreeMap<>();
     private CalendarSourcesPanel drawer;
     private AlertDialog eventDialog;
     private Data.Entry detailedEvent;
@@ -85,10 +95,11 @@ public final class CalendarScreen extends CalendarUi {
         requestRange();
     }
 
-    public void setData(List<Data.Source> sources, List<Data.Entry> events, String status, boolean connected) {
+    public void setData(List<Data.Source> sources, List<Data.Entry> events, String notice, boolean connected, long lastSync) {
         this.sources = sources == null ? Collections.emptyList() : new ArrayList<>(sources);
         this.events = events == null ? Collections.emptyList() : new ArrayList<>(events);
-        this.status = status == null ? "" : status;
+        this.notice = notice == null ? "" : notice;
+        this.lastSync = lastSync;
         this.connected = connected;
         if (detailedEvent != null && this.events.stream().noneMatch(e -> e.id.equals(detailedEvent.id)
                 && e.calendarId.equals(detailedEvent.calendarId))) dismissEventDetails();
@@ -103,25 +114,56 @@ public final class CalendarScreen extends CalendarUi {
     }
 
     void tick(ZonedDateTime time) {
-        LocalDate previousDay = now.toLocalDate();
-        ZoneId previousZone = zone;
+        ZonedDateTime previous = now;
+        LocalDate previousDay = previous.toLocalDate();
         now = time;
         zone = time.getZone();
-        if (!previousDay.equals(now.toLocalDate()) || !previousZone.equals(zone)) {
-            if (followToday) {
-                focus = now.toLocalDate();
-                if (mode == Mode.WEEK && followWeekTime) {
+        updateSyncStatus();
+        LocalDate today = now.toLocalDate();
+        boolean zoneChanged = !previous.getZone().equals(zone);
+        if (!previousDay.equals(today) || zoneChanged) {
+            LocalDate oldFirst = first(), oldAfter = after();
+            if (followToday) focus = today;
+            if (zoneChanged || !oldFirst.equals(first()) || !oldAfter.equals(after())) {
+                if (mode == Mode.WEEK && followToday && followWeekTime) {
                     // Start the new day at its time and column, including on a narrow screen.
                     board = null;
                     topHour = leftDay = Double.NaN;
                 }
+                requestRange();
+                return;
             }
-            requestRange();
-        } else if (mode == Mode.DAY) {
-            scheduleRender();
-        } else if (board != null) {
-            board.updateNow();
+            if (board != null) board.updateDate();
+            Runnable oldHighlight = monthHighlights.get(previousDay);
+            Runnable newHighlight = monthHighlights.get(today);
+            if (oldHighlight != null) oldHighlight.run();
+            if (newHighlight != null) newHighlight.run();
+            if (dayCard != null) populateDayCard();
         }
+        long before = previous.toInstant().toEpochMilli(), instant = now.toInstant().toEpochMilli();
+        // Only update displayed segments whose exclusive end was crossed, in either direction.
+        if (before != instant && !eventEnds.isEmpty()) {
+            long first = Math.min(before, instant), last = Math.max(before, instant);
+            for (List<Runnable> changes : eventEnds.subMap(first, false, last, true).values()) {
+                for (Runnable change : changes) change.run();
+            }
+        }
+        if (dayClock != null && focus.equals(today)) {
+            if (previous.getHour() != now.getHour() || previous.getMinute() != now.getMinute()) dayClock.setText(now.format(CLOCK));
+            if (instant < before || instant >= nextSummaryChange) updateDaySummary();
+        }
+        if (board != null) board.updateNow();
+    }
+
+    void onEventEnd(long end, Runnable update) {
+        eventEnds.computeIfAbsent(end, unused -> new ArrayList<>()).add(update);
+    }
+
+    void fadeEvent(View view, Data.Entry event, LocalDate day) {
+        long end = CalendarGeometry.segmentEnd(event, day, zone);
+        Runnable update = () -> view.setAlpha(now.toInstant().toEpochMilli() >= end ? PAST_EVENT_ALPHA : 1f);
+        onEventEnd(end, update);
+        update.run();
     }
 
     private void requestRange() {
@@ -245,6 +287,10 @@ public final class CalendarScreen extends CalendarUi {
         rememberScroll();
         board = null;
         agendaScroll = null;
+        dayCard = daySummary = null;
+        dayClock = monthTodayBadge = null;
+        monthHighlights.clear();
+        eventEnds.clear();
         size(root.getWidth(), root.getHeight());
         root.removeAllViews();
         LinearLayout page = column();
@@ -376,14 +422,41 @@ public final class CalendarScreen extends CalendarUi {
             legend.addView(key, lp(WRAP, MATCH));
         }
         row.addView(scroller, growX());
-        String label = blank(status) ? (connected ? "已连接飞书" : "尚未连接飞书") : status;
-        TextView sync = text(label, choice(17, 12), MUTED, false);
-        sync.setMaxWidth(contentWidth * (legend.getChildCount() == 0 ? 2 : 1) / 3);
-        clickable(sync, label + "，显示日历", this::openDrawer);
-        row.addView(sync, lp(WRAP, MATCH));
+        footerStatus = text("", choice(17, 12), MUTED, false);
+        footerStatus.setMaxLines(2);
+        footerStatus.setMaxWidth(contentWidth * 2 / 3);
+        clickable(footerStatus, "显示日历", this::openDrawer);
+        row.addView(footerStatus, lp(WRAP, MATCH));
+        updateSyncStatus();
+    }
+
+    String syncStatus() {
+        if (lastSync <= 0) return blank(notice) ? (connected ? "已连接飞书" : "尚未连接飞书") : notice;
+        ZonedDateTime synced = Instant.ofEpochMilli(lastSync).atZone(zone);
+        DateTimeFormatter format = synced.toLocalDate().equals(now.toLocalDate()) ? CLOCK : DATE_CLOCK;
+        long minutes = Math.max(0, ChronoUnit.MINUTES.between(synced, now));
+        String age;
+        if (minutes == 0) age = "刚刚";
+        else if (minutes < 60) age = minutes + "分钟前";
+        else if (minutes < 24 * 60) age = minutes / 60 + "小时前";
+        else age = minutes / (24 * 60) + "天前";
+        return (blank(notice) ? "" : notice + " · ") + "上次同步 " + synced.format(format) + "（" + age + "）";
+    }
+
+    private void updateSyncStatus() {
+        String label = syncStatus();
+        if (footerStatus != null && !label.contentEquals(footerStatus.getText())) {
+            footerStatus.setText(label);
+            footerStatus.setContentDescription(label + "，显示日历");
+        }
+        if (drawer != null && drawer.isShowing()) drawer.setStatus(label);
     }
 
     private View month() {
+        if (wide) {
+            monthTodayBadge = text("今天", 16, GREEN, true);
+            pad(monthTodayBadge, 6, 0, 0, 0);
+        }
         LinearLayout body = column();
         pad(body, 0, 0, 0, choice(12, 6));
         LinearLayout days = row();
@@ -413,28 +486,40 @@ public final class CalendarScreen extends CalendarUi {
     }
 
     private LinearLayout monthCell(LocalDate date) {
-        boolean isToday = date.equals(now.toLocalDate());
         LinearLayout cell = column();
         pad(cell, choice(11, 3), choice(6, 5), choice(8, 2), 0);
-        cell.setBackgroundColor(isToday ? SAGE : PAPER);
         LinearLayout head = row();
         cell.addView(head, lp(MATCH, u(choice(30, 24))));
         boolean currentMonth = date.getMonth() == focus.getMonth();
-        TextView number = text(String.valueOf(date.getDayOfMonth()), choice(23, 16), isToday ? GREEN : currentMonth ? INK : MUTED, currentMonth);
+        TextView number = text(String.valueOf(date.getDayOfMonth()), choice(23, 16), INK, currentMonth);
         head.addView(number, lp(WRAP, MATCH));
-        if (isToday && wide) {
-            head.addView(space(), lp(u(6), 1));
-            head.addView(text("今天", 16, GREEN, true), lp(WRAP, MATCH));
-        }
         head.addView(space(), growX());
         List<Data.Entry> day = entries(date);
         int preview = 2;
         if (day.size() > preview) head.addView(text("+" + (day.size() - preview), choice(16, 10), MUTED, true), lp(WRAP, MATCH));
         for (int i = 0; i < Math.min(preview, day.size()); i++) {
             Data.Entry e = day.get(i);
-            cell.addView(tag(title(e), source(e).color, choice(18, 11), choice(8, 4), INK, false), lp(MATCH, u(choice(25, 18))));
+            View previewRow = tag(title(e), source(e).color, choice(18, 11), choice(8, 4), INK, false);
+            fadeEvent(previewRow, e, date);
+            cell.addView(previewRow, lp(MATCH, u(choice(25, 18))));
         }
-        clickable(cell, date + (isToday ? "，今天" : "") + "，" + day.size() + " 项日程", () -> select(Mode.DAY, date));
+        clickable(cell, date.toString(), () -> select(Mode.DAY, date));
+        Runnable highlight = () -> {
+            boolean today = date.equals(now.toLocalDate());
+            cell.setBackgroundColor(today ? SAGE : PAPER);
+            number.setTextColor(today ? GREEN : currentMonth ? INK : MUTED);
+            if (monthTodayBadge != null) {
+                if (today && monthTodayBadge.getParent() != head) {
+                    LinearLayout previous = (LinearLayout) monthTodayBadge.getParent();
+                    if (previous != null) previous.removeView(monthTodayBadge);
+                    head.addView(monthTodayBadge, 1, lp(WRAP, MATCH));
+                }
+                if (!today && monthTodayBadge.getParent() == head) head.removeView(monthTodayBadge);
+            }
+            cell.setContentDescription(date + (today ? "，今天" : "") + "，" + day.size() + " 项日程");
+        };
+        monthHighlights.put(date, highlight);
+        highlight.run();
         return cell;
     }
 
@@ -442,8 +527,9 @@ public final class CalendarScreen extends CalendarUi {
         LinearLayout body = wide ? row() : column();
         pad(body, 0, choice(22, 10), 0, choice(28, 5));
         List<Data.Entry> day = entries(focus);
-        LinearLayout card = dayCard(day);
-        body.addView(card, wide ? lp(contentWidth * 286 / 1000, MATCH) : lp(MATCH, u(100)));
+        dayCard = wide ? column() : row();
+        populateDayCard();
+        body.addView(dayCard, wide ? lp(contentWidth * 286 / 1000, MATCH) : lp(MATCH, u(100)));
         body.addView(space(), wide ? lp(u(35), 1) : lp(1, u(8)));
         LinearLayout list = column();
         body.addView(list, wide ? growX() : growY());
@@ -479,6 +565,7 @@ public final class CalendarScreen extends CalendarUi {
             details.addView(tag(src.name, src.color, choice(20, 14), choice(10, 7), eventInk(src.color), false), lp(MATCH, u(choice(29, 21))));
             entry.addView(details, growX());
             clickable(entry, title(e) + "，" + (e.allDay ? "全天" : startOn(e, focus) + " 至 " + endOn(e, focus)) + "，" + src.name, () -> eventDetails(e));
+            fadeEvent(entry, e, focus);
             rule(rows, LINE, hair());
         }
         int savedY = agendaY;
@@ -486,16 +573,18 @@ public final class CalendarScreen extends CalendarUi {
         return body;
     }
 
-    private LinearLayout dayCard(List<Data.Entry> day) {
+    private void populateDayCard() {
         boolean today = focus.equals(now.toLocalDate());
-        LinearLayout card = wide ? column() : row();
+        LinearLayout card = dayCard;
+        card.removeAllViews();
         card.setBackground(shape(SAGE, 10, 0));
         pad(card, choice(28, 14), choice(26, 8), choice(28, 12), choice(20, 8));
         LinearLayout clock = column();
         clock.setGravity(wide ? Gravity.TOP : Gravity.CENTER_VERTICAL);
         card.addView(clock, wide ? new LinearLayout.LayoutParams(MATCH, 0, 1f) : new LinearLayout.LayoutParams(0, MATCH, 1f));
         clock.addView(text(today ? "现在" : "所选日期", choice(22, 13), GREEN, true));
-        clock.addView(text(today ? now.format(CLOCK) : md(focus), today ? choice(98, 32) : choice(50, 24), INK, false));
+        dayClock = text(today ? now.format(CLOCK) : md(focus), today ? choice(98, 32) : choice(50, 24), INK, false);
+        clock.addView(dayClock);
         clock.addView(text("星期" + weekday(focus), choice(32, 15), INK, true));
         if (wide) rule(card, 0xffd7e1d2, hair());
         else {
@@ -503,21 +592,36 @@ public final class CalendarScreen extends CalendarUi {
             separator.setBackgroundColor(0xffd7e1d2);
             card.addView(separator, lp(hair(), MATCH));
         }
-        LinearLayout next = column();
-        next.setGravity(wide ? Gravity.TOP : Gravity.CENTER_VERTICAL);
-        pad(next, choice(0, 14), choice(24, 0), 0, 0);
-        card.addView(next, wide ? new LinearLayout.LayoutParams(MATCH, 0, .96f) : new LinearLayout.LayoutParams(0, MATCH, 1.1f));
+        daySummary = column();
+        daySummary.setGravity(wide ? Gravity.TOP : Gravity.CENTER_VERTICAL);
+        pad(daySummary, choice(0, 14), choice(24, 0), 0, 0);
+        card.addView(daySummary, wide ? new LinearLayout.LayoutParams(MATCH, 0, .96f) : new LinearLayout.LayoutParams(0, MATCH, 1.1f));
+        updateDaySummary();
+    }
+
+    private void updateDaySummary() {
+        LinearLayout next = daySummary;
+        next.removeAllViews();
+        boolean today = focus.equals(now.toLocalDate());
         long instant = now.toInstant().toEpochMilli();
         Data.Entry item = null;
-        for (Data.Entry e : day) {
+        for (Data.Entry e : entries(focus)) {
             if (!e.allDay && (!today || e.end > instant)) { item = e; break; }
         }
         boolean ongoing = today && item != null && item.start <= instant;
+        nextSummaryChange = today && item != null ? (ongoing ? item.end : item.start) : Long.MAX_VALUE;
         next.addView(text(today ? (ongoing ? "进行中" : "下一项") : "首项定时日程", choice(22, 13), MUTED, true));
         next.addView(space(), lp(1, u(choice(10, 3))));
-        next.addView(text(item == null ? "暂无定时日程" : title(item), item == null ? choice(26, 17) : choice(42, 19), INK, true));
-        if (item != null) next.addView(text((ongoing ? endOn(item, focus) + " 结束" : startOn(item, focus) + " 开始"), choice(25, 14), GREEN, false));
-        return card;
+        TextView summaryTitle = text(item == null ? "暂无定时日程" : title(item), item == null ? choice(26, 17) : choice(42, 19), INK, true);
+        next.addView(summaryTitle);
+        if (item != null) {
+            TextView when = text(ongoing ? endOn(item, focus) + " 结束" : startOn(item, focus) + " 开始", choice(25, 14), GREEN, false);
+            next.addView(when);
+            if (focus.isBefore(now.toLocalDate())) {
+                summaryTitle.setAlpha(PAST_EVENT_ALPHA);
+                when.setAlpha(PAST_EVENT_ALPHA);
+            }
+        }
     }
 
     final class ScreenRoot extends FrameLayout {

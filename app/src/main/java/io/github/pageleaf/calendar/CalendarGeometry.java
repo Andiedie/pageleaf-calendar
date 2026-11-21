@@ -33,6 +33,10 @@ final class CalendarGeometry {
         return date.atStartOfDay(zone).toInstant().toEpochMilli();
     }
 
+    static long segmentEnd(Data.Entry event, LocalDate day, ZoneId zone) {
+        return Math.min(event.end, midnight(day.plusDays(1), zone));
+    }
+
     static final Comparator<Data.Entry> AGENDA_ORDER = Comparator
             .comparing((Data.Entry e) -> !e.allDay)
             .thenComparingLong(e -> e.start)

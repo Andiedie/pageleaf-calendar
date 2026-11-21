@@ -87,36 +87,77 @@ public final class CalendarSyncTest extends InstrumentationTestCase {
         JSONObject first = catalog(shared);
         first.getJSONObject("data").put("has_more", true).put("page_token", "a+&/=");
         runSync(DAY, DAY.plusDays(1), first, catalog(calendar("room", "resource", "writer"),
-                calendar("external", "exchange", "owner"), calendar("busy", "primary", "free_busy_reader")));
-        assertEquals(2, requests.size());
+                calendar("external", "exchange", "owner"), calendar("busy", "primary", "free_busy_reader")),
+                page("items", timed("booking", DAY)), page("items", timed("event_0", DAY)));
+        assertEquals(4, requests.size());
         assertEquals("a+&/=", requests.get(1).getQueryParameter("page_token"));
         assertEquals(4, store.sources().size());
         for (Data.Source source : store.sources()) {
-            assertFalse(source.enabled);
+            assertEquals(source.readable, source.enabled);
             if (source.id.equals("shared/@")) assertEquals("Team", source.name);
             assertEquals(source.id.equals("shared/@") || source.id.equals("room"), source.readable);
             if (!source.readable) assertFalse(source.reason.isEmpty());
         }
-        store.toggle("shared/@", true);
-        runSync(DAY, DAY.plusDays(1), catalog(shared), page("items", timed("event_0", DAY)));
+        assertEquals("/open-apis/calendar/v4/calendars/room/events", requests.get(2).getPath());
         Uri eventRequest = requests.get(3);
         assertEquals(Arrays.asList("open-apis", "calendar", "v4", "calendars", "shared/@", "events", "instance_view"),
                 eventRequest.getPathSegments());
         assertNull(eventRequest.getQueryParameter("page_size"));
-        assertEquals(1, store.sources().size());
-        assertTrue(store.sources().get(0).enabled);
-        assertEquals("event_0", store.events(DAY, DAY.plusDays(1)).get(0).id);
+        List<Data.Entry> events = store.events(DAY, DAY.plusDays(1));
+        assertEquals(2, events.size());
+        assertEquals("booking", events.get(0).id);
+        assertEquals("event_0", events.get(1).id);
         assertTrue(store.lastSync() > 0);
+    }
+
+    public void testRefreshPreservesDisabledChoicesAndFetchesNewCalendar() throws Exception {
+        JSONObject existing = calendar("a", "primary", "owner");
+        JSONObject busy = calendar("busy", "shared", "free_busy_reader");
+        runSync(DAY, DAY.plusDays(1), catalog(existing, busy), page("items", timed("cached", DAY)));
+        CalendarStore.Session session = store.session(auth, auth.sessionId());
+        session.toggle("a", false);
+        session.toggle("busy", true);
+
+        JSONObject added = calendar("new", "shared", "reader");
+        runSync(DAY, DAY.plusDays(1), catalog(existing.put("summary_alias", "A renamed"),
+                busy.put("role", "reader"), added), page("items", timed("first", DAY)));
+        assertTrue(requests.get(requests.size() - 1).getPath().endsWith("/new/events/instance_view"));
+        List<Data.Source> sources = store.sources();
+        assertEquals("A renamed", sources.get(0).name);
+        assertFalse(sources.get(0).enabled);
+        assertTrue(sources.get(1).readable);
+        assertFalse(sources.get(1).enabled);
+        assertTrue(sources.get(2).enabled);
+        List<Data.Entry> events = store.events(DAY, DAY.plusDays(1));
+        assertEquals(1, events.size());
+        assertEquals("new", events.get(0).calendarId);
+    }
+
+    public void testEmptyInstanceViewObjectCompletesWholeSync() throws Exception {
+        JSONObject list = catalog(calendar("a", "shared", "reader"), calendar("b", "shared", "reader"));
+        runSync(DAY, DAY.plusDays(1), list, page("items", timed("removed", DAY)), page("items"));
+        JSONObject emptyView = new JSONObject().put("code", 0).put("data", new JSONObject());
+        runSync(DAY, DAY.plusDays(1), list, emptyView, page("items", timed("new", DAY)));
+        List<Data.Entry> events = store.events(DAY, DAY.plusDays(1));
+        assertEquals(1, events.size());
+        assertEquals("new", events.get(0).id);
+        long completed = store.lastSync();
+        JSONObject malformed = new JSONObject().put("code", 0).put("data", new JSONObject().put("items", "invalid"));
+        try {
+            runSync(DAY, DAY.plusDays(1), list, emptyView, malformed);
+            fail("Wrongly typed items must not clear the cache");
+        } catch (IOException expected) {
+            assertEquals(completed, store.lastSync());
+            assertEquals("new", store.events(DAY, DAY.plusDays(1)).get(0).id);
+        }
     }
 
     public void testOverfullInstanceViewSplitsAndDeduplicates() throws Exception {
         JSONObject list = catalog(calendar("shared", "shared", "reader"));
-        runSync(DAY, DAY.plusDays(42), list);
-        store.toggle("shared", true);
         JSONObject event = timed("series_123456", DAY.plusDays(1));
         runSync(DAY, DAY.plusDays(42), list, new Net.HttpError(400, 193104, ""),
                 page("items", event), page("items", event), page("items", timed("series_234567", DAY.plusDays(40))));
-        for (Uri uri : requests.subList(2, requests.size())) {
+        for (Uri uri : requests.subList(1, requests.size())) {
             long start = Long.parseLong(uri.getQueryParameter("start_time"));
             long end = Long.parseLong(uri.getQueryParameter("end_time"));
             assertTrue(end > start && end - start < 40 * 86_400);
@@ -127,9 +168,6 @@ public final class CalendarSyncTest extends InstrumentationTestCase {
     public void testCacheSurvivesPartialDownloadAndRedactsFailure() throws Exception {
         JSONObject a = calendar("a", "primary", "owner"), b = calendar("b", "shared", "reader");
         JSONObject list = catalog(a, b);
-        runSync(DAY, DAY.plusDays(1), list);
-        store.toggle("a", true);
-        store.toggle("b", true);
         runSync(DAY, DAY.plusDays(1), list, page("items", timed("old_a", DAY)), page("items", timed("old_b", DAY)));
         long completed = store.lastSync();
         try {
@@ -154,9 +192,6 @@ public final class CalendarSyncTest extends InstrumentationTestCase {
 
     public void testPerCalendarAccessLossAndGlobalPermissionError() throws Exception {
         JSONObject list = catalog(calendar("a", "primary", "owner"), calendar("b", "shared", "reader"));
-        runSync(DAY, DAY.plusDays(1), list);
-        store.toggle("a", true);
-        store.toggle("b", true);
         runSync(DAY, DAY.plusDays(1), list, page("items", timed("private", DAY)), page("items", timed("keep", DAY)));
         runSync(DAY, DAY.plusDays(1), list, new Net.HttpError(403, 191002, ""), page("items", timed("keep", DAY)));
         assertFalse(store.sources().get(0).readable);
@@ -178,8 +213,6 @@ public final class CalendarSyncTest extends InstrumentationTestCase {
         try {
             TimeZone.setDefault(TimeZone.getTimeZone("America/New_York"));
             JSONObject list = catalog(calendar("p", "primary", "owner"));
-            runSync(DAY, DAY.plusDays(2), list);
-            store.toggle("p", true);
             JSONObject allDay = new JSONObject().put("event_id", "holiday").put("start_time",
                     new JSONObject().put("date", DAY.toString())).put("end_time",
                     new JSONObject().put("date", DAY.plusDays(1).toString()));
@@ -199,8 +232,6 @@ public final class CalendarSyncTest extends InstrumentationTestCase {
 
     public void testMovedCancelledAndUnsubscribed() throws Exception {
         JSONObject list = catalog(calendar("p", "primary", "owner"));
-        runSync(DAY, DAY.plusDays(1), list);
-        store.toggle("p", true);
         runSync(DAY, DAY.plusDays(1), list, page("items", timed("move", DAY), timed("cancel", DAY)));
         runSync(DAY.plusDays(8), DAY.plusDays(9), list, page("items", timed("move", DAY.plusDays(8))));
         assertEquals(1, store.events(DAY, DAY.plusDays(1)).size());
@@ -212,9 +243,8 @@ public final class CalendarSyncTest extends InstrumentationTestCase {
         store.toggle("p", true);
         assertEquals(1, store.events(DAY, DAY.plusDays(9)).size());
         runSync(DAY, DAY.plusDays(1), catalog());
-        runSync(DAY, DAY.plusDays(1), list);
-        assertFalse(store.sources().get(0).enabled);
-        store.toggle("p", true);
+        runSync(DAY, DAY.plusDays(1), list, page("items"));
+        assertTrue(store.sources().get(0).enabled);
         assertTrue(store.events(DAY, DAY.plusDays(9)).isEmpty());
         store.clear();
         assertEquals(0L, store.lastSync());
@@ -223,8 +253,6 @@ public final class CalendarSyncTest extends InstrumentationTestCase {
 
     public void testRoomExpansionIncludesOverridesAndPages() throws Exception {
         JSONObject list = catalog(calendar("room", "resource", "reader"));
-        runSync(DAY, DAY.plusDays(3), list);
-        store.toggle("room", true);
         JSONObject master = timed("master_0", DAY.minusYears(2)).put("recurrence", "FREQ=DAILY");
         JSONObject override = timed("master_100", DAY.plusDays(1)).put("is_exception", true).put("summary", "moved");
         JSONObject cancelled = new JSONObject().put("event_id", "master_200").put("is_exception", true).put("status", "cancelled");
@@ -232,10 +260,10 @@ public final class CalendarSyncTest extends InstrumentationTestCase {
         first.getJSONObject("data").put("has_more", true).put("page_token", "more&");
         runSync(DAY, DAY.plusDays(3), list, page("items", master, override, cancelled), first,
                 page("items", timed("master_300", DAY.plusDays(2))));
-        assertNotNull(requests.get(2).getQueryParameter("anchor_time"));
-        assertNull(requests.get(2).getQueryParameter("start_time"));
-        assertTrue(requests.get(3).getPath().endsWith("/room/events/master_0/instances"));
-        assertEquals("more&", requests.get(4).getQueryParameter("page_token"));
+        assertNotNull(requests.get(1).getQueryParameter("anchor_time"));
+        assertNull(requests.get(1).getQueryParameter("start_time"));
+        assertTrue(requests.get(2).getPath().endsWith("/room/events/master_0/instances"));
+        assertEquals("more&", requests.get(3).getQueryParameter("page_token"));
         List<Data.Entry> events = store.events(DAY, DAY.plusDays(3));
         assertEquals(2, events.size());
         assertEquals("moved", events.get(0).title);
@@ -244,8 +272,6 @@ public final class CalendarSyncTest extends InstrumentationTestCase {
 
     public void testDenseViewFallsBackToPaginatedEvents() throws Exception {
         JSONObject list = catalog(calendar("primary", "primary", "owner"));
-        runSync(DAY, DAY.plusDays(1), list);
-        store.toggle("primary", true);
         JSONObject fallback = page("items", timed("crowded", DAY));
         int[] calls = {0};
         sync = new CalendarSync(store.session(auth, auth.sessionId()), (url, bearer) -> {
@@ -266,8 +292,6 @@ public final class CalendarSyncTest extends InstrumentationTestCase {
 
     public void testMalformedResponsesAndTransientStatusesPreserveCache() throws Exception {
         JSONObject list = catalog(calendar("p", "primary", "owner"));
-        runSync(DAY, DAY.plusDays(1), list);
-        store.toggle("p", true);
         runSync(DAY, DAY.plusDays(1), list, page("items", timed("cached", DAY)));
         long completed = store.lastSync();
         for (int status : new int[]{401, 403, 429, 503}) {
@@ -294,8 +318,6 @@ public final class CalendarSyncTest extends InstrumentationTestCase {
     public void testRefreshingRoomTodayPreservesFutureExceptionOffline() throws Exception {
         JSONObject list = catalog(calendar("room", "resource", "reader"));
         JSONObject future = timed("overridden_123", DAY.plusDays(8)).put("is_exception", true);
-        runSync(DAY, DAY.plusDays(1), list);
-        store.toggle("room", true);
         runSync(DAY.plusDays(8), DAY.plusDays(9), list, page("items", future));
         runSync(DAY, DAY.plusDays(1), list, page("items", future));
         assertTrue(store.events(DAY, DAY.plusDays(1)).isEmpty());
@@ -310,8 +332,6 @@ public final class CalendarSyncTest extends InstrumentationTestCase {
         try {
             store = new CalendarStore(context, database);
             sync = new CalendarSync(store.session(auth, auth.sessionId()), (url, bearer) -> (JSONObject) replies.remove(0));
-            runSync(DAY, DAY.plusDays(1), list);
-            store.toggle("c", true);
             runSync(DAY, DAY.plusDays(1), list, page("items", timed("persist", DAY)));
             long firstSync = store.lastSync();
             store.close();

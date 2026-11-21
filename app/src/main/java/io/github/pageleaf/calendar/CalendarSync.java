@@ -14,7 +14,6 @@ import java.time.ZoneOffset;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
-import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -70,11 +69,10 @@ public final class CalendarSync {
             catalog.put(id, new Data.Source(id, name.isEmpty() ? "未命名日历" : name, color,
                     false, reason.isEmpty(), reason));
         });
-        // A complete catalog is authoritative for unsubscribes and permission loss even
-        // when a subsequent event request fails. Partial lists never reach the cache.
-        List<Data.Source> sources = session.catalog(catalog);
         Map<String, Map<String, Data.Entry>> snapshots = new LinkedHashMap<>();
-        for (Data.Source source : sources) {
+        // Commit the complete catalog even if a later event request fails. Its stored
+        // switches include defaults for calendars discovered during this sync.
+        for (Data.Source source : session.catalog(catalog)) {
             if (!source.enabled || !source.readable) continue;
             Uri events = CALENDARS.buildUpon().appendPath(source.id).appendPath("events").build();
             Map<String, Data.Entry> rows = new LinkedHashMap<>();
@@ -133,6 +131,8 @@ public final class CalendarSync {
         JSONArray items;
         try {
             JSONObject data = get(range(view, start, end), bearer);
+            // Feishu omits the items field entirely for an empty instance view.
+            if (data.length() == 0) return;
             items = data.getJSONArray("items");
             if (items.length() >= 1000 || data.optBoolean("has_more")) throw new Net.HttpError(200, 193104, "");
         } catch (Net.HttpError error) {

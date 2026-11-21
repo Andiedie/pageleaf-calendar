@@ -18,10 +18,7 @@ import android.view.View;
 import android.widget.FrameLayout;
 
 import java.io.IOException;
-import java.time.Instant;
 import java.time.LocalDate;
-import java.time.ZoneId;
-import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -371,14 +368,6 @@ public final class MainActivity extends Activity implements CalendarScreen.Actio
     }
 
     private void render() {
-        String status = notice;
-        if (lastSync > 0) {
-            ZoneId zone = ZoneId.systemDefault();
-            Instant instant = Instant.ofEpochMilli(lastSync);
-            String format = instant.atZone(zone).toLocalDate().equals(LocalDate.now(zone)) ? "HH:mm" : "MM-dd HH:mm";
-            String time = DateTimeFormatter.ofPattern(format).withZone(zone).format(instant);
-            status += (status.isEmpty() ? "" : " · ") + "上次同步 " + time;
-        }
-        screen.setData(sources, entries, status, !uiSession.isEmpty() && !signingOut);
+        screen.setData(sources, entries, notice, !uiSession.isEmpty() && !signingOut, lastSync);
     }
 }

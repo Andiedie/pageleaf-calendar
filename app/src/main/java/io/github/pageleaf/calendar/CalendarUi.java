@@ -19,6 +19,7 @@ class CalendarUi {
     static final int PAPER = 0xfffcfbf7, INK = 0xff23332e, MUTED = 0xff59665e;
     static final int GREEN = 0xff315747, LINE = 0xffe2e4db, PALE = 0xfff0f2eb;
     static final int SAGE = 0xffe9efe5, TODAY = 0xfff3f6ed, RED = 0xffbf352e;
+    static final float PAST_EVENT_ALPHA = .82f;
     static final int MATCH = -1, WRAP = -2;
     final Activity activity;
     boolean wide;

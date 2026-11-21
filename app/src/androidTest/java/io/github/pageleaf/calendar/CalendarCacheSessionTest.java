@@ -7,6 +7,7 @@ import android.content.ContextWrapper;
 import android.content.SharedPreferences;
 import android.database.DatabaseUtils;
 import android.database.sqlite.SQLiteDatabase;
+import android.os.SystemClock;
 import android.test.InstrumentationTestCase;
 
 import org.json.JSONArray;
@@ -15,12 +16,14 @@ import org.json.JSONObject;
 import java.io.IOException;
 import java.lang.reflect.Field;
 import java.time.LocalDate;
+import java.util.Collections;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 public final class CalendarCacheSessionTest extends InstrumentationTestCase {
     private static final LocalDate DAY = LocalDate.of(2025, 3, 9);
@@ -84,8 +87,6 @@ public final class CalendarCacheSessionTest extends InstrumentationTestCase {
         CalendarSync sync = new CalendarSync(session(), (url, bearer) ->
                 "calendars".equals(android.net.Uri.parse(url).getLastPathSegment()) ? calendars : events);
         sync.sync(owner, DAY, DAY.plusDays(1));
-        session().toggle("common", true);
-        sync.sync(owner, DAY, DAY.plusDays(1));
     }
 
     public void testColdCredentialReadFailureHidesThenRestoresCacheAndChoices() throws Exception {
@@ -139,12 +140,19 @@ public final class CalendarCacheSessionTest extends InstrumentationTestCase {
             });
             credentials.unavailable = false;
             ins.runOnMainSync(() -> activity.rangeChanged(DAY, DAY.plusDays(1)));
-            cache.submit(() -> { }).get(5, TimeUnit.SECONDS);
-            ins.waitForIdleSync();
-            ins.runOnMainSync(() -> {
-                assertEquals("A calendar", screen.sources.get(0).name);
-                assertTrue(screen.sources.get(0).enabled);
-            });
+            // A network callback can supersede the first queued snapshot and request another.
+            AtomicReference<Data.Source> restored = new AtomicReference<>();
+            long deadline = SystemClock.elapsedRealtime() + 5000;
+            while (SystemClock.elapsedRealtime() < deadline) {
+                ins.runOnMainSync(() -> {
+                    if (!screen.sources.isEmpty()) restored.set(screen.sources.get(0));
+                });
+                if (restored.get() != null) break;
+                SystemClock.sleep(10);
+            }
+            assertNotNull("Cache was not displayed after credentials became available", restored.get());
+            assertEquals("A calendar", restored.get().name);
+            assertTrue(restored.get().enabled);
             // Hold the main queue until SQLite has posted A's rows, then install B before delivery.
             ins.runOnMainSync(() -> {
                 try {
@@ -206,6 +214,7 @@ public final class CalendarCacheSessionTest extends InstrumentationTestCase {
                 // RC2 could adopt the preference for B while retaining A's rows.
                 db.execSQL("UPDATE cache_owner SET session=? WHERE id=1", new Object[]{grant});
             }
+            db.execSQL("DROP TABLE removed_source_preferences");
             db.setVersion(version);
             assertCacheRowCounts(db, 1);
             store.close();
@@ -214,7 +223,7 @@ public final class CalendarCacheSessionTest extends InstrumentationTestCase {
             SQLiteDatabase migrated = store.getWritableDatabase();
             // Check physical rows before snapshot() can bind B or filter the event join.
             assertCacheRowCounts(migrated, 0);
-            assertEquals(3, migrated.getVersion());
+            assertEquals(4, migrated.getVersion());
             assertEquals("", DatabaseUtils.stringForQuery(migrated, "SELECT session FROM cache_owner WHERE id=1", null));
             auth = new FeishuAuth(credentials, null);
             assertEquals(grant, auth.sessionId());
@@ -242,6 +251,81 @@ public final class CalendarCacheSessionTest extends InstrumentationTestCase {
         }
     }
 
+    public void testVersionThreePreservesSwitchesAndCacheAcrossDiscovery() throws Exception {
+        Context target = getInstrumentation().getTargetContext();
+        String name = "cache-v3-" + UUID.randomUUID();
+        store.close();
+        try {
+            store = new CalendarStore(target, name);
+            seed("A");
+            long completed = snapshot().lastSync;
+            SQLiteDatabase db = store.getWritableDatabase();
+            db.execSQL("DROP TABLE removed_source_preferences");
+            // V3 used the same zero for an untouched switch and an explicit opt-out.
+            db.execSQL("INSERT INTO sources(id,name,color,reason) VALUES('off','off',0,'')");
+            db.setVersion(3);
+            store.close();
+
+            store = new CalendarStore(target, name);
+            CalendarStore.Snapshot upgraded = snapshot();
+            assertEquals(completed, upgraded.lastSync);
+            assertEquals("A event", upgraded.events.get(0).title);
+            assertTrue(upgraded.sources.get(0).enabled);
+            assertFalse(upgraded.sources.get(1).enabled);
+            JSONObject calendars = catalog("A calendar");
+            JSONArray items = calendars.getJSONObject("data").getJSONArray("calendar_list");
+            for (String id : new String[]{"off", "new"}) {
+                items.put(new JSONObject().put("calendar_id", id).put("summary", id)
+                        .put("type", "shared").put("role", "reader"));
+            }
+            JSONObject events = event("synced");
+            CalendarSync sync = new CalendarSync(session(), (url, bearer) -> {
+                android.net.Uri uri = android.net.Uri.parse(url);
+                if ("calendars".equals(uri.getLastPathSegment())) return calendars;
+                assertFalse(uri.getPath().contains("/off/"));
+                return events;
+            });
+            sync.sync("A", DAY, DAY.plusDays(1));
+            CalendarStore.Snapshot refreshed = snapshot();
+            assertEquals(2, refreshed.events.size());
+            assertEquals("common", refreshed.events.get(0).calendarId);
+            assertEquals("new", refreshed.events.get(1).calendarId);
+            assertFalse(refreshed.sources.get(2).enabled);
+        } finally {
+            store.close();
+            target.deleteDatabase(name);
+        }
+    }
+
+    public void testRemovedCalendarKeepsOnlySwitchUntilGrantEnds() throws Exception {
+        Context target = getInstrumentation().getTargetContext();
+        String name = "cache-removed-" + UUID.randomUUID();
+        store.close();
+        try {
+            store = new CalendarStore(target, name);
+            seed("A");
+            session().toggle("common", false);
+            session().catalog(Collections.emptyMap());
+            assertEquals(0L, DatabaseUtils.queryNumEntries(store.getReadableDatabase(), "sources"));
+            assertEquals(0L, DatabaseUtils.queryNumEntries(store.getReadableDatabase(), "events"));
+            store.close();
+            store = new CalendarStore(target, name);
+            JSONObject calendars = catalog("Resubscribed");
+            CalendarSync sync = new CalendarSync(session(), (url, bearer) -> {
+                assertEquals("calendars", android.net.Uri.parse(url).getLastPathSegment());
+                return calendars;
+            });
+            sync.sync("A", DAY, DAY.plusDays(1));
+            assertFalse(snapshot().sources.get(0).enabled);
+            session().catalog(Collections.emptyMap());
+            auth.signOut(auth.sessionId(), store::clear);
+            assertEquals(0L, DatabaseUtils.queryNumEntries(store.getReadableDatabase(), "removed_source_preferences"));
+        } finally {
+            store.close();
+            target.deleteDatabase(name);
+        }
+    }
+
     private static void assertCacheRowCounts(SQLiteDatabase db, long expected) {
         for (String table : new String[]{"sources", "events", "sync_state"}) {
             assertEquals(table, expected, DatabaseUtils.queryNumEntries(db, table));
@@ -251,6 +335,9 @@ public final class CalendarCacheSessionTest extends InstrumentationTestCase {
     public void testStaleSwitchAndSnapshotCannotRebindAfterLogin() throws Exception {
         seed("A");
         CalendarStore.Session old = session();
+        old.toggle("common", false);
+        old.catalog(Collections.emptyMap());
+        assertTrue(snapshot().sources.isEmpty());
         // A cold reader holding A still considers its credential valid even after SQLite rebinds.
         FeishuAuth oldReader = new FeishuAuth(credentials, null);
         CalendarStore.Session oldOwner = store.session(oldReader, oldReader.sessionId());

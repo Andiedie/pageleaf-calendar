@@ -20,6 +20,7 @@ final class CalendarSourcesPanel {
     private final CalendarScreen ui;
     private final Dialog dialog;
     private ScrollView listScroll;
+    private TextView statusView;
 
     CalendarSourcesPanel(CalendarScreen ui) {
         this.ui = ui;
@@ -92,14 +93,17 @@ final class CalendarSourcesPanel {
             controls.addView(ui.space(), growX());
             controls.addView(ui.button("立即同步", ui.choice(17, 15), GREEN, true, "立即同步", ui.actions::refresh), lp(ui.u(96), MATCH));
         }
-        String status = CalendarScreen.blank(ui.status) ? (ui.connected ? "已连接飞书" : "尚未连接飞书") : ui.status;
-        TextView state = ui.text(status, ui.choice(17, 13), MUTED, false);
-        state.setMaxLines(2);
-        panel.addView(state, lp(MATCH, WRAP));
+        statusView = ui.text(ui.syncStatus(), ui.choice(17, 13), MUTED, false);
+        statusView.setMaxLines(3);
+        panel.addView(statusView, lp(MATCH, WRAP));
         dialog.setContentView(panel);
         final ScrollView current = listScroll;
         current.post(() -> current.scrollTo(0, savedY));
         fitWindow();
+    }
+
+    void setStatus(String label) {
+        if (statusView != null && !label.contentEquals(statusView.getText())) statusView.setText(label);
     }
 
     private void sourceRow(LinearLayout items, Data.Source src) {

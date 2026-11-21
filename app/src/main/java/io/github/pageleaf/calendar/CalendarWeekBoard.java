@@ -1,8 +1,10 @@
 package io.github.pageleaf.calendar;
 
 import android.graphics.Canvas;
+import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
@@ -25,13 +27,18 @@ import static io.github.pageleaf.calendar.CalendarUi.*;
 
 /** The date strip and all-day ribbon stay fixed while the 24-hour grid scrolls. */
 final class CalendarWeekBoard {
+    private static final int ELAPSED_FILL_ALPHA = Math.round(255 * .40f);
+    private static final float ELAPSED_TEXT_OPACITY = .86f;
     private final CalendarScreen ui;
     final LinearLayout view;
     private final LocalDate monday;
-    private final int railWidth, daysWidth, hourHeight, inset, gridHeight, stripHeight, dayIndex;
+    private final int railWidth, daysWidth, hourHeight, inset, gridHeight, stripHeight;
+    private int dayIndex;
     private final HorizontalScrollView headerX, bodyX;
     private final ScrollView hours;
-    private final Grid nowLine;
+    private final Grid grid, nowLine;
+    private final LinearLayout labels;
+    private final View ribbonToday;
     private final FrameLayout ribbons;
     private boolean restored;
     private boolean positioningHours, touchingHours;
@@ -47,6 +54,10 @@ final class CalendarWeekBoard {
         daysWidth = ui.wide ? visibleDaysWidth : Math.max(visibleDaysWidth, ui.u(104) * 7);
         int dateHeight = ui.u(ui.choice(55, 44));
         ribbons = new FrameLayout(ui.activity);
+        ribbonToday = ui.space();
+        ribbonToday.setBackgroundColor(TODAY);
+        ribbons.addView(ribbonToday);
+        positionRibbonToday();
         int laneHeight = ui.u(ui.choice(34, 28));
         int lanes = allDay(ribbons, laneHeight);
         int ribbonContent = Math.max(1, lanes) * laneHeight + ui.u(7);
@@ -67,7 +78,7 @@ final class CalendarWeekBoard {
         header.addView(headerX, growX());
         LinearLayout dates = ui.column();
         headerX.addView(dates, new FrameLayout.LayoutParams(daysWidth, stripHeight));
-        LinearLayout labels = ui.row();
+        labels = ui.row();
         dates.addView(labels, lp(daysWidth, dateHeight - ui.hair()));
         for (int i = 0; i < 7; i++) labels.addView(dateLabel(i), lp(edge(i + 1) - edge(i), MATCH));
         ui.rule(dates, LINE, ui.hair());
@@ -96,7 +107,8 @@ final class CalendarWeekBoard {
         table.addView(bodyX, new LinearLayout.LayoutParams(0, gridHeight, 1f));
         FrameLayout plane = new FrameLayout(ui.activity);
         bodyX.addView(plane, new FrameLayout.LayoutParams(daysWidth, gridHeight));
-        plane.addView(new Grid(Layer.GRID), at(0, 0, daysWidth, gridHeight));
+        grid = new Grid(Layer.GRID);
+        plane.addView(grid, at(0, 0, daysWidth, gridHeight));
         for (int i = 0; i < 7; i++) {
             LocalDate day = monday.plusDays(i);
             for (CalendarGeometry.Slot slot : CalendarGeometry.timedSlots(ui.entries(day), day, ui.zone)) {
@@ -136,7 +148,7 @@ final class CalendarWeekBoard {
     private void positionRibbonLabels(int viewportLeft) {
         for (int i = 0; i < ribbons.getChildCount(); i++) {
             View chip = ribbons.getChildAt(i);
-            if (!(chip instanceof LinearLayout)) continue;
+            if (!(chip instanceof AllDayRibbon)) continue;
             FrameLayout.LayoutParams p = (FrameLayout.LayoutParams) chip.getLayoutParams();
             int offset = Math.max(0, Math.min(viewportLeft - p.leftMargin, p.width - ui.u(24)));
             int pad = offset + ui.u(9);
@@ -156,11 +168,40 @@ final class CalendarWeekBoard {
     void rememberScroll() {
         if (!restored) return;
         ui.topHour = hours.getScrollY() / (double) hourHeight;
-        if (daysWidth > bodyX.getWidth()) ui.leftDay = bodyX.getScrollX() * 7.0 / daysWidth;
+        // A wide board can briefly be clipped while resizing. Its offset is not a saved narrow viewport.
+        if (!ui.wide && daysWidth > bodyX.getWidth()) ui.leftDay = bodyX.getScrollX() * 7.0 / daysWidth;
     }
 
+    void updateDate() {
+        int previous = dayIndex;
+        dayIndex = (int) ChronoUnit.DAYS.between(monday, ui.now.toLocalDate());
+        boolean wasVisible = previous >= 0 && previous < 7;
+        boolean isVisible = dayIndex >= 0 && dayIndex < 7;
+        if (!wasVisible && !isVisible) return;
+        if (wasVisible) replaceDateLabel(previous);
+        if (isVisible) replaceDateLabel(dayIndex);
+        positionRibbonToday();
+        grid.invalidate();
+        if (!isVisible) nowLine.invalidate();
+        if (restored && isVisible && ui.followWeekTime && ui.followToday && !touchingHours) {
+            positionHours((int) Math.round(defaultHour() * hourHeight));
+            bodyX.scrollTo(edge(Math.max(0, dayIndex - 1)), 0);
+        }
+    }
+
+    private void replaceDateLabel(int index) {
+        labels.removeViewAt(index);
+        labels.addView(dateLabel(index), index, lp(edge(index + 1) - edge(index), MATCH));
+    }
+
+    private void positionRibbonToday() {
+        boolean visible = dayIndex >= 0 && dayIndex < 7;
+        ribbonToday.setVisibility(visible ? View.VISIBLE : View.GONE);
+        if (visible) ribbonToday.setLayoutParams(at(edge(dayIndex), 0, edge(dayIndex + 1) - edge(dayIndex), MATCH));
+    }
 
     void updateNow() {
+        if (dayIndex < 0 || dayIndex >= 7) return;
         nowLine.invalidate();
         followNowIfNeeded();
     }
@@ -205,11 +246,6 @@ final class CalendarWeekBoard {
     }
 
     private int allDay(FrameLayout parent, int laneHeight) {
-        if (dayIndex >= 0 && dayIndex < 7) {
-            View today = ui.space();
-            today.setBackgroundColor(TODAY);
-            parent.addView(today, at(edge(dayIndex), 0, edge(dayIndex + 1) - edge(dayIndex), MATCH));
-        }
         Set<Data.Entry> seen = new HashSet<>();
         List<Data.Entry> entries = new ArrayList<>();
         for (int d = 0; d < 7; d++) for (Data.Entry event : ui.entries(monday.plusDays(d))) {
@@ -224,16 +260,83 @@ final class CalendarWeekBoard {
             while (lane < ends.size() && ends.get(lane) > firstDay) lane++;
             if (lane == ends.size()) ends.add(afterDay);
             else ends.set(lane, afterDay);
-            int color = ui.source(event).color;
-            LinearLayout chip = ui.tag(CalendarScreen.title(event), color, ui.choice(18, 14), ui.choice(9, 6), eventInk(color), true);
+            AllDayRibbon chip = new AllDayRibbon(event, firstDay, afterDay);
             ui.pad(chip, 9, 0, 5, 0);
-            chip.setBackground(ui.shape(eventFill(color), 5, 0));
+            chip.setClipToOutline(true);
             ui.clickable(chip, CalendarScreen.title(event) + "，全天", () -> ui.eventDetails(event));
             int gap = ui.u(4);
             parent.addView(chip, at(edge(firstDay) + gap, ui.u(5) + lane * laneHeight,
                     edge(afterDay) - edge(firstDay) - 2 * gap, laneHeight - ui.u(3)));
         }
         return ends.size();
+    }
+
+    /** One scrolling label and click target span all days, including the elapsed part. */
+    private final class AllDayRibbon extends FrameLayout {
+        private final GradientDrawable background;
+        private final int fill, elapsedFill;
+        private final View label;
+        private final int firstDay, afterDay;
+        private final Data.Entry event;
+        private int pastWidth = -1;
+
+        AllDayRibbon(Data.Entry event, int firstDay, int afterDay) {
+            super(ui.activity);
+            this.event = event;
+            this.firstDay = firstDay;
+            this.afterDay = afterDay;
+            int color = ui.source(event).color;
+            fill = eventFill(color);
+            elapsedFill = Color.argb(ELAPSED_FILL_ALPHA, Color.red(fill), Color.green(fill), Color.blue(fill));
+            background = ui.shape(fill, 5, 0);
+            background.setOrientation(GradientDrawable.Orientation.LEFT_RIGHT);
+            setBackground(background);
+            label = ui.tag(CalendarScreen.title(event), color, ui.choice(18, 14), ui.choice(9, 6), eventInk(color), true);
+            addView(label);
+            Runnable update = this::updatePastWidth;
+            for (int d = firstDay; d < afterDay; d++) {
+                ui.onEventEnd(CalendarGeometry.segmentEnd(event, monday.plusDays(d), ui.zone), update);
+            }
+            update.run();
+        }
+
+        private void updatePastWidth() {
+            int today = (int) ChronoUnit.DAYS.between(monday, ui.now.toLocalDate());
+            int gap = ui.u(4);
+            int width = edge(afterDay) - edge(firstDay) - 2 * gap;
+            int elapsed = ui.now.toInstant().toEpochMilli() >= event.end || today >= afterDay ? width
+                    : today <= firstDay ? 0 : edge(today) - edge(firstDay) - gap;
+            if (pastWidth != elapsed) {
+                pastWidth = elapsed;
+                if (elapsed == 0 || elapsed == width) {
+                    background.setColor(elapsed == 0 ? fill : elapsedFill);
+                } else {
+                    // The two stops at midnight make a sharp boundary between the day segments.
+                    float boundary = elapsed / (float) width;
+                    background.setColors(new int[]{elapsedFill, elapsedFill, fill, fill},
+                            new float[]{0f, boundary, boundary, 1f});
+                }
+                label.setAlpha(elapsed == width ? ELAPSED_TEXT_OPACITY : 1f);
+                invalidate();
+            }
+        }
+
+        @Override protected void dispatchDraw(Canvas canvas) {
+            if (pastWidth <= 0 || pastWidth >= getWidth()) {
+                super.dispatchDraw(canvas);
+                return;
+            }
+            // A single scrolling label can cross midnight. Fade only its elapsed pixels.
+            int saved = canvas.save();
+            canvas.clipRect(0, 0, pastWidth, getHeight());
+            canvas.saveLayerAlpha(0, 0, pastWidth, getHeight(), Math.round(255 * ELAPSED_TEXT_OPACITY));
+            super.dispatchDraw(canvas);
+            canvas.restoreToCount(saved);
+            saved = canvas.save();
+            canvas.clipRect(pastWidth, 0, getWidth(), getHeight());
+            super.dispatchDraw(canvas);
+            canvas.restoreToCount(saved);
+        }
     }
 
     private int y(double minute) { return inset + (int) Math.round(hourHeight * minute / 60.0); }
@@ -250,12 +353,26 @@ final class CalendarWeekBoard {
         LinearLayout card = ui.column();
         boolean small = height < ui.u(ui.choice(45, 33));
         ui.pad(card, small || slot.lanes > 1 ? 3 : ui.choice(10, 5), small ? 0 : 3, 2, 0);
-        card.setBackground(ui.shape(eventFill(color), 5, 0));
+        int fill = eventFill(color);
+        GradientDrawable background = ui.shape(fill, 5, 0);
+        card.setBackground(background);
         String name = CalendarScreen.title(slot.event);
         String when = ui.startOn(slot.event, day) + "–" + ui.endOn(slot.event, day);
-        card.addView(ui.text(name, small ? ui.choice(16, 13) : ui.choice(22, 16), ink, true), lp(MATCH, WRAP));
-        if (!small) card.addView(ui.text(when, ui.choice(15, 12), ink, false), lp(MATCH, WRAP));
+        TextView title = ui.text(name, small ? ui.choice(16, 13) : ui.choice(22, 16), ink, true);
+        card.addView(title, lp(MATCH, WRAP));
+        TextView time = small ? null : ui.text(when, ui.choice(15, 12), ink, false);
+        if (time != null) card.addView(time, lp(MATCH, WRAP));
         ui.clickable(card, name + "，" + when + "，" + ui.source(slot.event).name, () -> ui.eventDetails(slot.event));
+        long end = CalendarGeometry.segmentEnd(slot.event, day, ui.zone);
+        Runnable update = () -> {
+            boolean elapsed = ui.now.toInstant().toEpochMilli() >= end;
+            background.setAlpha(elapsed ? ELAPSED_FILL_ALPHA : 255);
+            float textOpacity = elapsed ? ELAPSED_TEXT_OPACITY : 1f;
+            title.setAlpha(textOpacity);
+            if (time != null) time.setAlpha(textOpacity);
+        };
+        ui.onEventEnd(end, update);
+        update.run();
         plane.addView(card, at(laneStart + gap, y(slot.start) + ui.hair(), width, height));
     }
 

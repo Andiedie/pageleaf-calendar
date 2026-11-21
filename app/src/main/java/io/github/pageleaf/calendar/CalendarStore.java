@@ -24,7 +24,7 @@ public final class CalendarStore extends SQLiteOpenHelper {
     private static final String OVERLAP = "((all_day=0 AND starts<? AND ends>?) OR "
             + "(all_day=1 AND starts<? AND ends>?))";
 
-    private static final int DATABASE_VERSION = 3;
+    private static final int DATABASE_VERSION = 4;
 
     public CalendarStore(Context context) {
         this(context, "calendar.db");
@@ -47,16 +47,25 @@ public final class CalendarStore extends SQLiteOpenHelper {
         db.execSQL("CREATE INDEX event_range ON events(calendar_id,all_day,starts)");
         db.execSQL("CREATE TABLE sync_state (id INTEGER PRIMARY KEY, completed INTEGER NOT NULL)");
         createOwner(db);
+        createRemovedPreferences(db);
     }
 
     @Override public void onUpgrade(SQLiteDatabase db, int oldVersion, int newVersion) {
-        if ((oldVersion != 1 && oldVersion != 2) || newVersion != 3) {
+        if (oldVersion < 1 || oldVersion > 3 || newVersion != DATABASE_VERSION) {
             throw new IllegalStateException("Unsupported calendar cache version");
         }
-        // Pre-release v2 could adopt mixed v1 rows. Reset both caches in the helper's upgrade transaction.
-        eraseRows(db);
-        if (oldVersion == 1) createOwner(db);
-        else db.execSQL("UPDATE cache_owner SET session='' WHERE id=1");
+        // V3 already stores each grant's switches. Keep every value, including legacy default-off rows.
+        createRemovedPreferences(db);
+        if (oldVersion < 3) {
+            // Pre-release v2 could adopt mixed v1 rows. Reset both caches in the upgrade transaction.
+            eraseRows(db);
+            if (oldVersion == 1) createOwner(db);
+            else db.execSQL("UPDATE cache_owner SET session='' WHERE id=1");
+        }
+    }
+
+    private static void createRemovedPreferences(SQLiteDatabase db) {
+        db.execSQL("CREATE TABLE removed_source_preferences (id TEXT PRIMARY KEY NOT NULL, enabled INTEGER NOT NULL)");
     }
 
     private static void createOwner(SQLiteDatabase db) {
@@ -148,7 +157,7 @@ public final class CalendarStore extends SQLiteOpenHelper {
         getWritableDatabase().update("sources", values, "id=? AND reason=''", new String[]{id});
     }
 
-    /** Apply only a completely enumerated catalog, preserving local switches for retained IDs. */
+    /** Apply a complete catalog. Remember the switch when deleting an unsubscribed source and its events. */
     private void updateSources(Map<String, Data.Source> catalog) {
         SQLiteDatabase db = getWritableDatabase();
         Set<String> obsolete = new HashSet<>();
@@ -158,15 +167,22 @@ public final class CalendarStore extends SQLiteOpenHelper {
                 if (!catalog.containsKey(id)) obsolete.add(id);
             }
         }
-        for (String id : obsolete) db.delete("sources", "id=?", new String[]{id});
+        for (String id : obsolete) {
+            db.execSQL("INSERT INTO removed_source_preferences(id,enabled) SELECT id,enabled FROM sources WHERE id=?",
+                    new Object[]{id});
+            db.delete("sources", "id=?", new String[]{id});
+        }
         for (Data.Source source : catalog.values()) {
             ContentValues values = new ContentValues();
             values.put("name", source.name);
             values.put("color", source.color);
             values.put("reason", source.reason);
             if (db.update("sources", values, "id=?", new String[]{source.id}) == 0) {
-                values.put("id", source.id);
-                db.insertOrThrow("sources", null, values);
+                db.execSQL("INSERT INTO sources(id,name,color,reason,enabled) VALUES(?,?,?,?,"
+                                + "COALESCE((SELECT enabled FROM removed_source_preferences WHERE id=?),?))",
+                        new Object[]{source.id, source.name, source.color, source.reason, source.id,
+                                source.readable ? 1 : 0});
+                db.delete("removed_source_preferences", "id=?", new String[]{source.id});
             }
             if (!source.readable) db.delete("events", "calendar_id=?", new String[]{source.id});
         }
@@ -232,6 +248,7 @@ public final class CalendarStore extends SQLiteOpenHelper {
 
     private static void eraseRows(SQLiteDatabase db) {
         db.delete("sources", null, null);
+        db.delete("removed_source_preferences", null, null);
         db.delete("sync_state", null, null);
     }
 
